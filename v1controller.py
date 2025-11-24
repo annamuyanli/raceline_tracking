@@ -3,6 +3,11 @@ from numpy.typing import ArrayLike
 
 from simulator import RaceTrack
 
+# ---------------------------------------------------------------------------
+# Simple global flag to track whether we've "started" the lap (for finish logic)
+# ---------------------------------------------------------------------------
+_lap_started = False
+
 
 def _wrap_angle(angle: float) -> float:
     """Wrap angle to [-pi, pi]."""
@@ -69,10 +74,14 @@ def controller(
     state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack
 ) -> ArrayLike:
     """
-    High-level controller: pure-pursuit steering + steering-based speed limit.
+    High-level controller: pure-pursuit steering + steering-based speed limit
+    with additional finish-line aiming so that the car passes close to the
+    starting point after one lap.
 
     Returns desired [delta_ref, v_ref].
     """
+    global _lap_started
+
     _ensure_avg_ds(racetrack)
 
     pos = state[0:2]          # [sx, sy]
@@ -81,6 +90,19 @@ def controller(
 
     cl = racetrack.centerline
     n = cl.shape[0]
+
+    # -----------------------------------------------------------------------
+    # Finish-line logic: track distance to start and mark lap started
+    # -----------------------------------------------------------------------
+    start_pos = cl[0, 0:2]
+    progress = float(np.linalg.norm(pos - start_pos))
+
+    # Treat lap as "started" once we're sufficiently far from the start
+    START_LEAVE_DIST = 25.0   # meters
+    FINISH_WINDOW = 40.0      # meters radius around the start to aim at it
+
+    if (not _lap_started) and progress > START_LEAVE_DIST:
+        _lap_started = True
 
     # 1) Find closest point on centerline
     diff = cl - pos
@@ -98,6 +120,18 @@ def controller(
     idx_target = (idx_closest + index_offset) % n
     target = cl[idx_target]
 
+    # -----------------------------------------------------------------------
+    # Finish-line aiming: when we've done a lap and are back near the start,
+    # gradually change the pure-pursuit target to the exact start point.
+    # -----------------------------------------------------------------------
+    if _lap_started and progress < FINISH_WINDOW:
+        # Blend between normal target and the start position.
+        # w = 0 at progress == FINISH_WINDOW, w -> 1 as progress -> 0.
+        w = (FINISH_WINDOW - progress) / FINISH_WINDOW
+        w = max(0.0, min(1.0, w))
+        target = (1.0 - w) * target + w * start_pos
+
+    # Pure pursuit towards "target"
     vec_to_target = target - pos
     Ld_actual = max(np.linalg.norm(vec_to_target), 1.0)
     angle_to_target = np.arctan2(vec_to_target[1], vec_to_target[0])
@@ -127,5 +161,9 @@ def controller(
     # Always keep some forward motion, but not exceed v_max
     v_min_des = 8.0
     v_ref = float(np.clip(v_ref, v_min_des, v_max_global))
+
+    # Extra slowdown near the finish so we don't overshoot the 1 m radius
+    if _lap_started and progress < FINISH_WINDOW:
+        v_ref = min(v_ref, 20.0)
 
     return np.array([delta_ref, v_ref])
