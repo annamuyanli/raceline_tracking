@@ -4,9 +4,9 @@ from numpy.typing import ArrayLike
 from simulator import RaceTrack
 
 # ---------------------------------------------------------------------------
-# Simple global state (per simulation) for lap tracking
+# Simple global flag to track whether we've "started" the lap (for finish logic)
 # ---------------------------------------------------------------------------
-_lap_started = False  # becomes True once the car moves away from the start
+_lap_started = False
 
 
 def _wrap_angle(angle: float) -> float:
@@ -14,26 +14,26 @@ def _wrap_angle(angle: float) -> float:
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def _ensure_track_cache(racetrack: RaceTrack) -> None:
+def _ensure_avg_ds(racetrack: RaceTrack):
     """
-    Precompute and cache:
-      - _avg_ds   : average spacing between centerline points
-      - _start_pos: starting centerline position (index 0)
+    Precompute average spacing between centerline points.
+    We only need this to convert a desired look-ahead distance
+    into an index offset along the track.
     """
-    if getattr(racetrack, "_cache_ready", False):
+    if getattr(racetrack, "_avg_ds_computed", False):
         return
 
-    cl = racetrack.centerline  # shape (N, 2)
+    cl = racetrack.centerline
     n = cl.shape[0]
 
+    # Differences between consecutive points (with wrap-around)
     next_idx = (np.arange(n) + 1) % n
     diffs = cl[next_idx] - cl
     ds = np.linalg.norm(diffs, axis=1)
     ds[ds < 1e-6] = 1e-6
 
-    racetrack._avg_ds = float(np.mean(ds))
-    racetrack._start_pos = cl[0, 0:2].copy()
-    racetrack._cache_ready = True
+    racetrack.avg_ds = float(np.mean(ds))
+    racetrack._avg_ds_computed = True
 
 
 def lower_controller(
@@ -56,14 +56,14 @@ def lower_controller(
     e_delta = _wrap_angle(delta_ref - delta)
     e_v = v_ref - v
 
-    # P gains: fairly aggressive for responsive control
-    k_delta = 5.0   # steering rate gain
-    k_v = 1.5       # acceleration gain
+    # P gains (tuned for responsiveness without oscillation)
+    k_delta = 3.0   # steering rate gain
+    k_v = 0.8       # acceleration gain
 
     steer_rate = k_delta * e_delta
     accel = k_v * e_v
 
-    # Actuator limits from parameters
+    # Actuator limits
     steer_rate = np.clip(steer_rate, parameters[7], parameters[9])
     accel = np.clip(accel, parameters[8], parameters[10])
 
@@ -74,104 +74,96 @@ def controller(
     state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack
 ) -> ArrayLike:
     """
-    High-level controller:
-      - Pure-pursuit steering along centerline
-      - Recovery mode when far off track (steer back to closest point)
-      - Finish-line aiming near the start after one lap
-      - Simple speed planning based on mode and steering magnitude
+    High-level controller: pure-pursuit steering + steering-based speed limit
+    with additional finish-line aiming so that the car passes close to the
+    starting point after one lap.
 
     Returns desired [delta_ref, v_ref].
     """
     global _lap_started
 
-    _ensure_track_cache(racetrack)
+    _ensure_avg_ds(racetrack)
 
-    # Unpack state
-    pos = np.array(state[0:2], dtype=float)  # [sx, sy]
+    pos = state[0:2]          # [sx, sy]
     v = float(state[3])
     phi = float(state[4])
 
     cl = racetrack.centerline
     n = cl.shape[0]
-    avg_ds = float(racetrack._avg_ds)
-    start_pos = racetrack._start_pos
 
     # -----------------------------------------------------------------------
-    # Lap progress relative to start (same as simulator's start point)
+    # Finish-line logic: track distance to start and mark lap started
     # -----------------------------------------------------------------------
-    d_start = float(np.linalg.norm(pos - start_pos))
-    if (not _lap_started) and d_start > 30.0:
+    start_pos = cl[0, 0:2]
+    progress = float(np.linalg.norm(pos - start_pos))
+
+    # Treat lap as "started" once we're sufficiently far from the start
+    START_LEAVE_DIST = 25.0   # meters
+    FINISH_WINDOW = 40.0      # meters radius around the start to aim at it
+
+    if (not _lap_started) and progress > START_LEAVE_DIST:
         _lap_started = True
 
-    # -----------------------------------------------------------------------
     # 1) Find closest point on centerline
-    # -----------------------------------------------------------------------
-    diff = cl - pos  # shape (N, 2)
+    diff = cl - pos
     dists_sq = np.einsum("ij,ij->i", diff, diff)
     idx_closest = int(np.argmin(dists_sq))
-    dist_closest = float(np.sqrt(dists_sq[idx_closest]))
 
-    # Compute a forward lookahead index along the centerline
+    # 2) Choose look-ahead point based on speed
     v_abs = abs(v)
-    lookahead_distance = 15.0 + 0.8 * v_abs  # meters ahead
-    index_offset = max(2, int(lookahead_distance / max(avg_ds, 1e-3)))
-    idx_target = (idx_closest + index_offset) % n
+    L0 = 20.0   # base look-ahead [m]
+    L1 = 0.4    # extra look-ahead per m/s
+    lookahead_distance = L0 + L1 * v_abs
 
-    # -----------------------------------------------------------------------
-    # 2) Choose a geometric target based on mode
-    # -----------------------------------------------------------------------
-    # Default: look ahead along centerline
+    avg_ds = getattr(racetrack, "avg_ds", 5.0)
+    index_offset = max(1, int(lookahead_distance / max(avg_ds, 1e-3)))
+    idx_target = (idx_closest + index_offset) % n
     target = cl[idx_target]
 
-    # Recovery mode: far away from track -> aim directly at closest centerline point
-    if dist_closest > 30.0:
-        target = cl[idx_closest]
-    # Finish-line aiming: after we've gone around once, aim at the exact start
-    elif _lap_started and d_start < 50.0:
-        target = start_pos
-
     # -----------------------------------------------------------------------
-    # 3) Pure-pursuit steering towards the chosen target
+    # Finish-line aiming: when we've done a lap and are back near the start,
+    # gradually change the pure-pursuit target to the exact start point.
     # -----------------------------------------------------------------------
-    vec = target - pos
-    Ld = float(np.linalg.norm(vec))
-    if Ld < 1e-3:
-        Ld = 1e-3
+    if _lap_started and progress < FINISH_WINDOW:
+        # Blend between normal target and the start position.
+        # w = 0 at progress == FINISH_WINDOW, w -> 1 as progress -> 0.
+        w = (FINISH_WINDOW - progress) / FINISH_WINDOW
+        w = max(0.0, min(1.0, w))
+        target = (1.0 - w) * target + w * start_pos
 
-    angle_to_target = float(np.arctan2(vec[1], vec[0]))
+    # Pure pursuit towards "target"
+    vec_to_target = target - pos
+    Ld_actual = max(np.linalg.norm(vec_to_target), 1.0)
+    angle_to_target = np.arctan2(vec_to_target[1], vec_to_target[0])
     alpha = _wrap_angle(angle_to_target - phi)
 
+    # 3) Pure-pursuit steering law
     wheelbase = float(parameters[0])
-    delta_pp = np.arctan2(2.0 * wheelbase * np.sin(alpha), Ld)
+    delta_ref = np.arctan2(2.0 * wheelbase * np.sin(alpha), Ld_actual)
 
     # Steering angle limits
     delta_min = float(parameters[1])
     delta_max = float(parameters[4])
-    delta_ref = float(np.clip(delta_pp, delta_min, delta_max))
+    delta_ref = float(np.clip(delta_ref, delta_min, delta_max))
 
-    # -----------------------------------------------------------------------
-    # 4) Speed planning by mode + steering magnitude
-    # -----------------------------------------------------------------------
+    # 4) Speed planning from steering (lateral-accel bound)
     v_max_global = float(parameters[5])
-    v_min_des = 10.0  # always keep some forward motion
+    ay_limit = 15.0  # m/s^2, heuristic lateral-accel limit
 
-    # Base speed by mode
-    if dist_closest > 30.0:
-        # Recovery: go slowly while we steer back to the track
-        v_base = 12.0
-    elif _lap_started and d_start < 50.0:
-        # Near finish: don't overshoot the 1 m start radius
-        v_base = 25.0
-    else:
-        # Normal running: fairly fast
-        v_base = 40.0
+    abs_tan_delta = max(abs(np.tan(delta_ref)), 1e-3)
+    v_curve = np.sqrt(ay_limit * wheelbase / abs_tan_delta)
+    v_curve = min(v_curve, v_max_global)
 
-    # Slow down in tight turns
-    steer_mag = abs(delta_ref)
-    curv_factor = 1.0 / (1.0 + 1.8 * steer_mag)
-    v_ref = v_base * curv_factor
+    # Reduce speed further when look-ahead angle is large
+    scale_alpha = 1.0 / (1.0 + 1.0 * abs(alpha))
+    v_ref = v_curve * scale_alpha
 
-    # Clip to allowed range
+    # Always keep some forward motion, but not exceed v_max
+    v_min_des = 8.0
     v_ref = float(np.clip(v_ref, v_min_des, v_max_global))
+
+    # Extra slowdown near the finish so we don't overshoot the 1 m radius
+    if _lap_started and progress < FINISH_WINDOW:
+        v_ref = min(v_ref, 20.0)
 
     return np.array([delta_ref, v_ref])
