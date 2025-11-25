@@ -234,7 +234,23 @@ def controller(
     # -----------------------------------------------------------------------
     
     v_max_global = float(parameters[5])
-    ay_limit = 15.0  # Lateral acceleration limit (m/s^2)
+    
+    # Dynamic ay_limit to allow faster exit from curves
+    # If current curvature is significantly higher than immediate future, we are exiting.
+    k_current = abs(kappa)
+    k_future_max = 0.0
+    # Check immediate future (next 5 points) to see if curve is ending
+    for i in range(1, 6): 
+        idx_next = (idx_closest + i) % n
+        k_fut_imm = abs(_get_local_curvature(cl, idx_next))
+        k_future_max = max(k_future_max, k_fut_imm)
+
+    # Base limit is conservative (11.0) for entry/mid-corner
+    # Exit limit is aggressive (15.0) to speed up sooner
+    if k_current > k_future_max + 0.01: # Exiting
+        ay_limit = 15.0
+    else:
+        ay_limit = 11.0
 
     # A. Steering-based limit: Slow down if steering angle is large
     #    v^2 / R = ay_limit  =>  v = sqrt(ay_limit * R)
@@ -251,8 +267,8 @@ def controller(
     #    This allows the car to brake *before* entering a turn.
     kappa_target = _get_local_curvature(cl, idx_target)
     
-    horizon_steps = 3    # Check every 3rd point
-    horizon_range = 20   # Check ~20 points ahead
+    horizon_steps = 1    # Check every 3rd point
+    horizon_range = 50   # Check ~20 points ahead
     max_weighted_kappa = 0.0
     
     for i in range(1, horizon_range + 1):
@@ -260,7 +276,7 @@ def controller(
         k_fut = abs(_get_local_curvature(cl, future_idx))
         
         # Weight decreases with distance (brake less for far turns)
-        weight = 1.0 / (1.0 + 0.15 * i)
+        weight = 1.0 / (1.0 + 0.5 * i)
         k_weighted = k_fut * weight
         
         if k_weighted > max_weighted_kappa:
@@ -282,18 +298,18 @@ def controller(
     v_min_des = 8.0
     
     # Finish line deceleration profile
-    # Linearly ramp down speed from 50+ m/s to 3 m/s over the last 300m
-    FINISH_PREP_DIST = 300.0
+    # Linearly ramp down speed over the last 50m
+    FINISH_PREP_DIST = 50.0
     v_finish_limit = float('inf')
     
     if _lap_started and dist_remaining < FINISH_PREP_DIST:
-        v_finish_limit = 5.0 + (dist_remaining / FINISH_PREP_DIST) * 50.0
+        v_finish_limit = 10.0 + (dist_remaining / FINISH_PREP_DIST) * 50.0
         
         # Respect finish limit
         v_ref = min(v_ref, v_finish_limit)
         
         # Allow slowing down below minimum speed near finish
-        if dist_remaining < 40.0:
+        if dist_remaining < 20.0:
             v_min_des = 5.0 
 
     # Final clamp
