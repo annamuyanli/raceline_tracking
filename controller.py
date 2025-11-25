@@ -96,9 +96,11 @@ def lower_controller(
     e_delta = _wrap_angle(delta_ref - delta)
     e_v = v_ref - v
 
-    # Proportional gains (P-controller)
-    k_delta = 4.5   # Gain for steering rate
-    k_v = 0.8       # Gain for acceleration
+    # Proportional gains (Simple & Fast)
+    # High gain for steering to ensure we hit the desired angle immediately.
+    # The smoothness is handled by the Pure Pursuit lookahead in the high-level controller.
+    k_delta = 8.0   
+    k_v = 2.0       
 
     steer_rate = k_delta * e_delta
     accel = k_v * e_v
@@ -169,17 +171,18 @@ def controller(
     # Dynamic lookahead: look farther when fast, closer when slow
     v_abs = abs(v)
     L0 = 15.0    # Base lookahead (meters)
-    L1 = 0.6     # Increase per m/s of speed
+    L1 = 0.65    # Increase per m/s of speed (Increased slightly for stability)
     
     lookahead_distance = L0 + L1 * v_abs
 
     # Shorten lookahead in sharp turns (hairpins) for tighter cornering
+    # But keep it long enough to avoid jitter
     KAPPA_HAIRPIN = 0.025 
     if abs(kappa) > KAPPA_HAIRPIN:
-        lookahead_distance *= 0.6
-
+        lookahead_distance *= 0.7 # Less aggressive reduction (was 0.6)
+    
     # Clamp lookahead to reasonable bounds
-    Lmin, Lmax = 10.0, 40.0
+    Lmin, Lmax = 10.0, 50.0 # Increased max to 50 to stabilize straights
     lookahead_distance = max(Lmin, min(lookahead_distance, Lmax))
 
     # Convert distance to index offset
@@ -197,6 +200,46 @@ def controller(
     
     idx_target = (idx_closest + index_offset) % n
     target = cl[idx_target]
+
+    # Corner Cutting: Offset target towards the inside of the turn
+    # Calculate approximate normal vector at target
+    p_prev_t = cl[(idx_target - 1) % n, 0:2]
+    p_next_t = cl[(idx_target + 1) % n, 0:2]
+    v_t = p_next_t - p_prev_t
+    # Rotate 90 degrees left: (x, y) -> (-y, x)
+    normal_t = np.array([-v_t[1], v_t[0]])
+    norm_len = np.linalg.norm(normal_t)
+    if norm_len > 1e-6:
+        normal_t /= norm_len
+        
+        # Determine turn direction based on curvature sign
+        # Positive curvature usually means Left turn (depending on coord system)
+        # We'll assume standard: +dtheta is Left.
+        kappa_t = _get_local_curvature(cl, idx_target)
+        
+        # Offset distance (meters)
+        CUT_OFFSET_ENTRY = 1.5   # Wide Entry (Outside)
+        CUT_OFFSET_APEX = 0.8    # Tight Apex (Inside)
+
+        # Apply offset
+        # Logic:
+        # 1. If we are approaching a turn (future curvature high, current low): Shift OUTSIDE (-Sign)
+        # 2. If we are in a turn (current curvature high): Shift INSIDE (+Sign)
+        
+        kappa_here = _get_local_curvature(cl, idx_closest)
+        
+        # Define thresholds
+        K_STRAIGHT = 0.005
+        K_TURN = 0.02
+        
+        if abs(kappa_here) < K_STRAIGHT and abs(kappa_t) > K_TURN:
+            # Approaching turn: Move Outside (Opposite to turn direction)
+            # sign(kappa_t) is turn direction. 
+            target = target - normal_t * np.sign(kappa_t) * CUT_OFFSET_ENTRY
+            
+        elif abs(kappa_here) > K_TURN:
+            # In turn: Move Inside (Towards turn center)
+            target = target + normal_t * np.sign(kappa_here) * CUT_OFFSET_APEX
     
     # If very close to finish (last 40m), force target to start point
     if _lap_started and (dist_remaining < 40.0 or dist_from_start < 40.0):
@@ -250,7 +293,9 @@ def controller(
     if k_current > k_future_max + 0.01: # Exiting
         ay_limit = 15.0
     else:
-        ay_limit = 11.0
+        # Increased from 11.0 because Corner Cutting effectively widens the turn radius,
+        # allowing us to carry more speed for the same centerline curvature.
+        ay_limit = 12.5
 
     # A. Steering-based limit: Slow down if steering angle is large
     #    v^2 / R = ay_limit  =>  v = sqrt(ay_limit * R)
