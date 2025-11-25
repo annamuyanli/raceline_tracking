@@ -68,6 +68,7 @@ class Simulator:
     def run(self):
         try:
             if self.lap_finished:
+                print(f"Lap Finished. Time: {self.lap_time_elapsed:.2f}, Violations: {self.track_limit_violations}")
                 exit()
 
             self.figure.canvas.flush_events()
@@ -112,6 +113,7 @@ class Simulator:
             return True
 
         except KeyboardInterrupt:
+            print(f"Simulation stopped. Time: {self.lap_time_elapsed:.2f}, Violations: {self.track_limit_violations}")
             exit()
 
     def update_status(self):
